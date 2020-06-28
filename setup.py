@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
 setup(name='ym_service_streamer',
-      version="1.0.1",
+      version="1.0.2",
       description='Boosting your web service of deep learning applications',
       long_description=long_description,
       long_description_content_type="text/markdown",
@@ -18,7 +18,7 @@ setup(name='ym_service_streamer',
           'Operating System :: OS Independent',
       ],      
       keywords='service_streamer',
-      url='https://github.com/shannonAI',
+      url='https://github.com/yimian/service-streamer',
       packages=find_packages(exclude=["example"]),
       install_requires=[
           'redis',
