@@ -468,6 +468,83 @@ class RedisWorker(_BaseStreamWorker):
         self._redis.send_response(client_id, task_id, request_id, model_output)
 
 
+class RedisWorkerWithoutModel(_BaseStreamWorker):
+    def __init__(self, model_class, batch_size, worker_id, wakeup_queue, 
+                 input_queue, output_queue, max_latency=0.1, 
+                 redis_broker="localhost:6379", prefix='', *args, **kwargs):
+        super().__init__(model_class, batch_size, max_latency, *args, **kwargs)
+        self.worker_id = worker_id
+        self.wakeup_queue = wakeup_queue
+        self.input_queue = input_queue
+        self.output_queue = output_queue
+        self._redis = _RedisServer(0, redis_broker, prefix)
+        self._requests_queue = Queue()
+        self.back_thread = threading.Thread(target=self._loop_recv_request, name="thread_recv_request")
+        self.back_thread.daemon = True
+        self.back_thread.start() 
+
+    def _run_once(self):
+        batch = []
+        start_time = time.time()
+        for i in range(self._batch_size):
+            try:
+                item = self._recv_request(timeout=self._max_latency)
+            except TimeoutError:
+                # each item timeout exceed the max latency
+                break
+            else:
+                batch.append(item)
+            if (time.time() - start_time) > self._max_latency:
+                # total batch time exceeds the max latency
+                break
+        if not batch:
+            return 0
+
+        self.input_queue.put([i[3] for i in batch])
+        # wait for result, and wake up model if time out
+        while True:
+            try:
+                model_outputs = self.output_queue.get(timeout=TIMEOUT)
+            except Empty:
+                self.wakeup_queue.put(self.worker_id)
+            else:
+                break
+
+        # publish results to redis
+        for i, item in enumerate(batch):
+            client_id, task_id, request_id, _ = item
+            try:
+                self._send_response(client_id, task_id, request_id, model_outputs[i])
+            except Exception as e:
+                logger.warning('_run_once: an exception occurs in _send_response, {}', str(e))
+
+        batch_size = len(batch)
+        logger.info("[gpu worker {}] run_once batch_size: {} start_at: {} spend: {}",
+                    self._pid, batch_size, start_time, time.time() - start_time)
+        return batch_size
+
+    def _loop_recv_request(self):
+        logger.info("[gpu worker {}] start loop_recv_request", os.getpid())
+        while True:
+            message = self._redis.recv_request(timeout=TIMEOUT)
+            if message:
+                (client_id, task_id, request_id, request_item) = pickle.loads(message)
+                self._requests_queue.put((client_id, task_id, request_id, request_item))
+            else:
+                # sleep if recv timeout
+                time.sleep(TIME_SLEEP)
+
+    def _recv_request(self, timeout=TIMEOUT):
+        try:
+            item = self._requests_queue.get(timeout=timeout)
+        except Empty:
+            raise TimeoutError
+        else:
+            return item
+
+    def _send_response(self, client_id, task_id, request_id, model_output):
+        self._redis.send_response(client_id, task_id, request_id, model_output)
+
 def _setup_redis_worker_and_runforever(model_class, batch_size, max_latency, gpu_id,
                                        redis_broker, prefix='', max_wait_time=0, model_init_args=None,
                                        model_init_kwargs=None):
@@ -496,6 +573,72 @@ def run_redis_workers_forever(model_class, batch_size, max_latency=0.1,
 
     for p in procs:
         p.join()
+
+
+def _setup_redis_worker_without_model_and_runforever(model_class, batch_size, worker_id, 
+                                                     wakeup_queue, input_queue, output_queue, 
+                                                     max_latency, redis_broker, prefix=''):
+    redis_worker = RedisWorkerWithoutModel(model_class, batch_size, worker_id, wakeup_queue, input_queue, 
+                                           output_queue, max_latency, redis_broker=redis_broker, prefix=prefix)
+    redis_worker.run_forever()
+
+
+def _setup_model_and_run(model_class, input_queue, output_queue, max_wait_time, gpu_id,
+                         model_init_args, model_init_kwargs):
+    model = model_class(gpu_id)
+    timer = time.time()
+    model.init_model(*model_init_args, **model_init_kwargs)
+    logger.debug(f'load model successfully, cost time {time.time() - timer:.2f}')
+
+    while True:
+        try:
+            batch_input = input_queue.get(timeout=max_wait_time)
+        except Empty:
+            model.release_model()
+            break
+        else:
+            batch_result = model.predict(batch_input)
+            assert len(batch_input) == len(
+                batch_result), "input batch size {} and output batch size {} must be equal.".format(len(batch_input),
+                                                                                                    len(batch_result))
+            output_queue.put(batch_result)
+    logger.debug('model gets released')
+
+
+def run_redis_workers_without_model_forever(model_class, batch_size, max_latency=0.1,
+                              worker_num=1, cuda_devices=None, redis_broker="localhost:6379",
+                              prefix='', max_wait_time=None, mp_start_method='spawn', model_init_args=None,
+                              model_init_kwargs=None):
+    procs = []
+    in_out_queues = []
+    model_procs = [None] * worker_num
+    mp = multiprocessing.get_context(mp_start_method)
+    wakeup_queue = mp.Queue()
+    for i in range(worker_num):
+        input_queue = mp.Queue()
+        output_queue = mp.Queue()
+        in_out_queues.append((input_queue, output_queue))
+        args = [model_class, batch_size, i, wakeup_queue, input_queue, output_queue, max_latency, redis_broker, prefix]
+        p = mp.Process(target=_setup_redis_worker_without_model_and_runforever, args=args, name="stream_worker", daemon=True)
+        p.start()
+        procs.append(p)
+
+    model_init_args = model_init_args or []
+    model_init_kwargs = model_init_kwargs or {}
+    while True:
+        worker_id = wakeup_queue.get()
+        if model_procs[worker_id] and model_procs[worker_id].is_alive():
+            continue
+        logger.debug(f'restart model with worker_id {worker_id}')
+        if cuda_devices is not None:
+            gpu_id = cuda_devices[worker_id % len(cuda_devices)]
+        else:
+            gpu_id = None
+        args = [model_class, in_out_queues[worker_id][0], in_out_queues[worker_id][1], 
+                max_wait_time, gpu_id, model_init_args, model_init_kwargs]
+        p = mp.Process(target=_setup_model_and_run, args=args, name="running_model", daemon=True)
+        p.start()
+        model_procs[worker_id] = p
 
 
 class _RedisAgent(object):
